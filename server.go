@@ -14,6 +14,7 @@ import (
 
 const mongoDBHost = "127.0.0.1:27017"
 
+// registerScooter registers scooter when connects first or reconnect
 func registerScooter(imei string) string {
 	mongoSession, err := mgo.Dial(mongoDBHost)
 	if err != nil {
