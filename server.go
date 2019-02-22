@@ -2,30 +2,68 @@ package tcp
 
 import (
 	"bufio"
-	"log"
+	"flag"
 	"net"
+	"os"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/digitaloceanrepo/backend/common"
+	"github.com/digitaloceanrepo/backend/util"
+	"github.com/google/logger"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
 
 const mongoDBHost = "127.0.0.1:27017"
+const logPath = "/var/log/deezle.log"
 
-// registerScooter registers scooter when connects first or reconnect
-func registerScooter(imei string) string {
+var (
+	database *mgo.Database
+	verbose *bool
+)
+
+func init() {
+	// Logger
+	verbose = flag.Bool("verbose", false, "print info level logs to stdout")
+	flag.Parse()
+
+	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
+	if err != nil {
+		logger.Fatalf("Failed to open log file: %v", err)
+	}
+	defer lf.Close()
+	logger := logger.Init("Logger initialized!", *verbose, true, lf)
+	defer logger.Close()
+
+	// MongoDB session
 	mongoSession, err := mgo.Dial(mongoDBHost)
 	if err != nil {
-		log.Println("Error Connecting MongoDBHost")
+		logger.Fatalf("Error Connecting MongoHost")
 	}
 	mongoSession.SetMode(mgo.Monotonic, true)
-	defer mongoSession.Close()
+	database = mongoSession.DB("deezle")
+}
 
-	c := mongoSession.DB("lime").C("lock")
+func registerScooter(imei string) string {
+	session := database.Session.Copy()
+	defer session.Close()
+	d := database.C("scooterstatus").With(session)
+
+	var status common.ScooterStatus
+	status.ID = imei
+	err := d.Find(bson.M{"lockid": imei}).One(&status)
+	_ = d.Insert(&status)
+
+	session1 := database.Session.Copy()
+	defer session1.Close()
+	c := database.C("lock").With(session1)
+
 	var lock common.Lock
 	lock.LockID = imei
+	lock.Locked = "true"
+	lock.Reserved = "false"
+	lock.Occupied = "false"
 	lock.Instruction = ""
 	err = c.Find(bson.M{"lockid": imei}).One(&lock)
 	if err != nil {
@@ -40,186 +78,242 @@ func registerScooter(imei string) string {
 	return "Exists"
 }
 
-// handleRequestFromIoT handles the commands from IoT to server
-func handleRequestFromIoT(conn net.Conn) {
-	defer conn.Close()
-
-	// First, connect to DB that has all the scooter imei informations
-	mongoSession, err := mgo.Dial(mongoDBHost)
-	if err != nil {
-		log.Println("Error Connecting MongoDBHost")
-	}
-	mongoSession.SetMode(mgo.Monotonic, true)
-	defer mongoSession.Close()
-	c := mongoSession.DB("lime").C("lock")
-
-	for {
-		// Read message from IoT
-		message, _ := bufio.NewReader(conn).ReadString('\n')
-			
-		if strings.TrimSpace(message) != "" {
-			// Parse message from IoT
-			arr := strings.Split(message, ",")
-			imei := arr[2]
-			inst := arr[3]
-				
-			// Register
-			if inst == "Q0" {
-				result := registerScooter(imei)
-				if result == "Error" {
-					log.Println("Error while saving imei")
-				}
-				// Setting scooter with default setting condition
-				instruction := "*SCOS,OM,"
-				instruction += imei
-				/*
-					Setting all scooters as follows
-					Accelerometer sensitivity : middle
-					Unlock status info upload : On
-					Heartbeat upload interval : 240s
-					Unlock status info uploading interval : 10s
-				*/
-				instruction += ",S5,2,2,10,10"
-				instruction += "#"
-
-				arr := util.MakeCMD(instruction)
-				conn.Write(arr)
-			}
-
-			// Heartbeat
-			if inst == "H0" {
-				var lock common.Lock
-				err = c.Find(bson.M{"lockid": imei}).One(&lock)
-				if err != nil {
-					log.Println("imei Not Found")
-				}
-				scooterStatus := arr[4]
-				driveVolt := arr[5]
-				networkSignal := arr[6]
-				power := arr[7]
-				chargingStatus := arr[8]
-
-				lock.Power = power + "%"
-				lock.ScooterStatus = util.ScooterStatus(scooterStatus)
-				lock.DriveVolt = util.ConvertVoltage(driveVolt)
-				lock.NetworkSignal = networkSignal
-				lock.ChargingStatus = util.ChargingStatus(chargingStatus)
-
-				// Update lock in DB
-				colQuerier := bson.M{"lockid": lock.LockID}
-				changeStatus := bson.M{"$set": bson.M{"power":lock.Power, "scooterstatus":lock.ScooterStatus, "drivervolt":lock.DriveVolt, "networksignal":lock.NetworkSignal, "chargingstatus":lock.ChargingStatus}}
-				_ = c.Update(colQuerier, changeStatus)
-			}
-		}
-	}
-}
-
 // handleRequestFromClient handles the commands that triggers at first from server to IoT
 func handleRequestFromClient(conn net.Conn) {
-	defer conn.Close()
-
-	mongoSession, err := mgo.Dial(mongoDBHost)
+	session := database.Session.Copy()
+	defer session.Close()
+	c := database.C("lock").With(session)
+	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
 	if err != nil {
-		log.Println("Error Connecting MongoDBHost")
+		logger.Fatalf("Failed to open log file: %v", err)
 	}
-	mongoSession.SetMode(mgo.Monotonic, true)
-	defer mongoSession.Close()
-	c := mongoSession.DB("lime").C("lock")
+	defer lf.Close()
+	logger := logger.Init("Logger initialized!", *verbose, true, lf)
+	defer logger.Close()
 
 	for {
 		var imei string
 		// Read message from IoT
 		message, _ := bufio.NewReader(conn).ReadString('\n')
-					
+		logger.Info("Messsage from scooter", message)
+
 		if strings.TrimSpace(message) != "" {
 			// Parse message from IoT
 			arr := strings.Split(message, ",")
-			imei = arr[2]
-			inst := arr[3]
-			oper := arr[4]
-			var key string
+			if len(arr) > 4 && arr[0] == "*SCOR" && arr[1] == "OM" {
+				imei = arr[2]
+				inst := arr[3]
+				oper := arr[4]
+				var key string
 
-			if inst == "R0" {
-				key = arr[5]
-				instruction := "*SCOS,OM,"
-				instruction += imei
-				
-				if oper == "1" {
-					instruction += ",L1,"
-					instruction += key	
-					instruction += "#"
-				} else {
-					timestamp := util.MakeTimestamp()
-					instruction += ",L0,"
-					//instruction += "0,"
-					instruction += key
-					instruction += ",0,"
-					instruction += timestamp
-					instruction += "#"
+				// Register
+				if inst == "Q0" {
+					logger.Info("Connecting request from scooter:", imei)
+					result := registerScooter(imei)
+
+					if result == "Error" {
+						logger.Fatalf("Error while registering scooter:", imei)
+					}
+					if result == "Success" {
+						logger.Info("Successfully registered scooter:", imei)
+
+						// Setting scooter with default setting condition
+						instruction := "*SCOS,OM,"
+						instruction += imei
+						/*
+							Setting all scooters as follows
+							Accelerometer sensitivity : middle
+							Unlock status info upload : On
+							Heartbeat upload interval : 240s
+							Unlock status info uploading interval : 10s
+						*/
+						instruction += ",S5,2,2,10,10"
+						instruction += "#"
+
+						arr1 := util.MakeCMD(instruction)
+						logger.Info("Setting(S5) default values to scooter:", imei)
+						conn.Write(arr1)
+
+						instruction = "*SCOS,OM,"
+						instruction += imei
+						/*
+							Setting all scooters as follows
+							Uploading positioning interval : 10s
+						*/
+						instruction += ",D1,10"
+						instruction += "#"
+
+						arr1 = util.MakeCMD(instruction)
+						logger.Info("Setting(D1) default values to scooter:", imei)
+						conn.Write(arr1)
+					}
+					if result == "Exists" {
+						logger.Info("Already exists:", imei)
+					}
 				}
-				
-				arr := util.MakeCMD(instruction)
-				conn.Write(arr)
-			}
 
-			if inst == "L0" {
-				if oper == "0" {
+				// Heartbeat
+				if inst == "H0" {
+					logger.Info("Heartbeat packet from scooter:", imei)
+					var lock common.Lock
+					err := c.Find(bson.M{"lockid": imei}).One(&lock)
+					if err != nil {
+						logger.Fatalf("imei from scooter not found:", imei)
+					}
+					scooterStatus := arr[4]
+					driveVolt := arr[5]
+					networkSignal := arr[6]
+					power := arr[7]
+					chargingStatus := arr[8]
+
+					lock.Power, _ = strconv.Atoi(power)
+					lock.Locked = util.ScooterStatus(scooterStatus)
+					lock.DriveVolt = util.ConvertVoltage(driveVolt)
+					lock.NetworkSignal = networkSignal
+					lock.ChargingStatus = util.ChargingStatus(chargingStatus)
+
+					// Update lock in DB
+					colQuerier := bson.M{"lockid": lock.LockID}
+					changeStatus := bson.M{"$set": bson.M{"power": lock.Power, "locked": lock.Locked, "drivervolt": lock.DriveVolt, "networksignal": lock.NetworkSignal, "chargingstatus": lock.ChargingStatus}}
+					_ = c.Update(colQuerier, changeStatus)
+				}
+
+				if inst == "R0" {
+					logger.Info("R0 cmd from scooter:", imei)
+					key = arr[5]
+					instruction := "*SCOS,OM,"
+					instruction += imei
+
+					if oper == "1" {
+						instruction += ",L1,"
+						instruction += key
+						instruction += "#"
+					} else {
+						timestamp := util.MakeTimestamp()
+						instruction += ",L0,"
+						//instruction += "0,"
+						instruction += key
+						instruction += ",0,"
+						instruction += timestamp
+						instruction += "#"
+					}
+
+					arr := util.MakeCMD(instruction)
+					logger.Info("Sending cmd to scooter:", instruction, imei)
+					conn.Write(arr)
+				}
+
+				if inst == "W0" {
+					logger.Info("Alert message from scooter:", imei)
+					instruction := "*SCOS,OM,"
+					instruction += imei
+					instruction += ",V0,2"
+					instruction += "#"
+
+					arr := util.MakeCMD(instruction)
+					conn.Write(arr)
+				}
+
+				if inst == "L0" {
+					logger.Info("Unlocking Response from scooter:", imei)
 					instruction := "*SCOS,OM,"
 					instruction += imei
 					instruction += ",L0"
 					instruction += "#"
-					
+
 					arr := util.MakeCMD(instruction)
 					conn.Write(arr)
 
-					// set "Done" as the instruction in the DB
-					colQuerier := bson.M{"lockid": imei}
-					changeStatus := bson.M{"$set": bson.M{"lockid": imei, "instruction": "Done"}}
-					_ = c.Update(colQuerier, changeStatus)
-				} else {
-					// set "Fail" as the instruction in the DB
-					colQuerier := bson.M{"lockid": imei}
-					changeStatus := bson.M{"$set": bson.M{"lockid": imei, "instruction": "Fail"}}
-					_ = c.Update(colQuerier, changeStatus)
+					if oper == "0" {
+						// set "Done" as the instruction in the DB
+						colQuerier := bson.M{"lockid": imei}
+						changeStatus := bson.M{"$set": bson.M{"lockid": imei, "instruction": "Done"}}
+						_ = c.Update(colQuerier, changeStatus)
+					} else {
+						// set "Fail" as the instruction in the DB
+						colQuerier := bson.M{"lockid": imei}
+						changeStatus := bson.M{"$set": bson.M{"lockid": imei, "instruction": "Fail"}}
+						_ = c.Update(colQuerier, changeStatus)
+					}
 				}
-			}
 
-			if inst == "L1" {
-				if oper == "0" {
+				if inst == "L1" {
+					logger.Info("Locking Response from scooter:", imei)
 					instruction := "*SCOS,OM,"
 					instruction += imei
 					instruction += ",L1"
 					instruction += "#"
-					
+
 					arr := util.MakeCMD(instruction)
 					conn.Write(arr)
 
+					if oper == "0" {
+						// set "Done" as the instruction in the DB
+						colQuerier := bson.M{"lockid": imei}
+						changeStatus := bson.M{"$set": bson.M{"lockid": imei, "instruction": "Done"}}
+						_ = c.Update(colQuerier, changeStatus)
+					} else {
+						// set "Fail" as the instruction in the DB
+						colQuerier := bson.M{"lockid": imei}
+						changeStatus := bson.M{"$set": bson.M{"lockid": imei, "instruction": "Fail"}}
+						_ = c.Update(colQuerier, changeStatus)
+					}
+				}
+
+				if inst == "S1" {
 					// set "Done" as the instruction in the DB
 					colQuerier := bson.M{"lockid": imei}
 					changeStatus := bson.M{"$set": bson.M{"lockid": imei, "instruction": "Done"}}
-					_ = c.Update(colQuerier, changeStatus)
-				} else {
-					// set "Fail" as the instruction in the DB
-					colQuerier := bson.M{"lockid": imei}
-					changeStatus := bson.M{"$set": bson.M{"lockid": imei, "instruction": "Fail"}}
 					_ = c.Update(colQuerier, changeStatus)
 				}
-			}
 
-			if inst == "S1" {
-					// set "Done" as the instruction in the DB
+				if inst == "S6" {
+					power, _ := strconv.Atoi(arr[4])
+					speedMode := arr[5]
+					curSpeed := arr[6] + "km/h"
+					chargingStatus := util.ChargingStatus(arr[7])
+					bat1Volt := util.ConvertBatVoltage(arr[8])
+					bat2Volt := util.ConvertBatVoltage(arr[9])
+					locked := util.ScooterStatus(arr[10])
+					tmp := strings.Split(arr[11], "#")
+					networkSignal := tmp[0]
+
+					// Make scooter speed slower when battery is lower than 10%
+					if power < 10 {
+						logger.Info("Setting slow mode for scooter:", imei)
+						// Make scooter slower
+						cmd := "*SCOS,OM,"
+						cmd += imei
+						cmd += ",S4,1,1,1,2,2,6,6,6"
+						cmd += "#"
+						array := util.MakeCMD(cmd)
+						conn.Write(array)
+					}
+
+					// Update lock in DB
 					colQuerier := bson.M{"lockid": imei}
-					changeStatus := bson.M{"$set": bson.M{"lockid": imei, "instruction": "Done"}}
+					changeStatus := bson.M{"$set": bson.M{"power": power, "locked": locked, "networksignal": networkSignal, "speedmode": speedMode, "curspeed": curSpeed, "chargingstatus": chargingStatus, "bat1volt": bat1Volt, "bat2volt": bat2Volt}}
 					_ = c.Update(colQuerier, changeStatus)
+				}
+				if inst == "D0" {
+					positioning := arr[6]
+					latitude := util.CalculateLat(arr[7])
+					longitude := util.CalculateLon(arr[9])
+
+					// Update lock in DB
+					colQuerier := bson.M{"lockid": imei}
+					changeStatus := bson.M{"$set": bson.M{"positioning": positioning, "latitude": latitude, "longitude": longitude}}
+					_ = c.Update(colQuerier, changeStatus)
+				}
 			}
 		}
 
 		// Check if there are any commands from client for this imei
 		if imei != "" {
 			var lock common.Lock
-			err = c.Find(bson.M{"lockid": imei}).One(&lock)
+			err := c.Find(bson.M{"lockid": imei}).One(&lock)
 			if err != nil {
-				log.Println("imei Not Found")
+				logger.Fatalf("imei from API endpoint not found:", imei)
 			}
 
 			// Lock command from client
@@ -233,6 +327,7 @@ func handleRequestFromClient(conn net.Conn) {
 				cmd += timestamp
 				cmd += "#"
 				arr := util.MakeCMD(cmd)
+				logger.Info("Sending lock request to scooter:", imei)
 				conn.Write(arr)
 			}
 
@@ -247,6 +342,7 @@ func handleRequestFromClient(conn net.Conn) {
 				cmd += timestamp
 				cmd += "#"
 				arr := util.MakeCMD(cmd)
+				logger.Info("Sending unlock request to scooter:", imei)
 				conn.Write(arr)
 			}
 
@@ -289,104 +385,18 @@ func handleRequestFromClient(conn net.Conn) {
 	}
 }
 
-// In every 10 seconds, reguest scooter status and save information in DB
-func statusUpdator(conn net.Conn) {
-	defer conn.Close()
-
-	// First, connect to DB that has all the scooter imei informations
-	mongoSession, err := mgo.Dial(mongoDBHost)
-	if err != nil {
-		log.Println("Error Connecting MongoDBHost")
-	}
-	mongoSession.SetMode(mgo.Monotonic, true)
-	defer mongoSession.Close()
-	c := mongoSession.DB("lime").C("lock")
-
-	for {
-		time.Sleep(10 * time.Second)
-		var imei string
-		// Read message from IoT
-		message, _ := bufio.NewReader(conn).ReadString('\n')
-			
-		if strings.TrimSpace(message) != "" {
-			// Parse message from IoT
-			arr := strings.Split(message, ",")
-			imei = arr[2]
-			inst := arr[3]
-
-			var lock common.Lock
-			err = c.Find(bson.M{"lockid": imei}).One(&lock)
-			if err != nil {
-				log.Println("imei Not Found")
-			}
-
-			if inst == "S6" {
-				power := arr[4] + "%"
-				speedMode := arr[5]
-				curSpeed := arr[6] + "km/h"
-				chargingStatus := util.ChargingStatus(arr[7])
-				bat1Volt := util.ConvertBatVoltage(arr[8])
-				bat2Volt := util.ConvertBatVoltage(arr[9])
-
-				powerInt, _ := strconv.ParseFloat(power, 64)
-				if powerInt < 10 {
-					// Make scooter slower
-					cmd := "*SCOS,OM,"
-					cmd += imei
-					cmd += ",S7,1,1,1,2,2,6,6,6"
-					cmd += "#"
-					array := util.MakeCMD(cmd)
-					conn.Write(array)
-				}
-
-				// Update lock in DB
-				colQuerier := bson.M{"lockid": lock.LockID}
-				changeStatus := bson.M{"$set": bson.M{"power":power, "speedmode":speedMode, "curspeed":curSpeed, "chargingstatus":chargingStatus, "bat1volt":bat1Volt, "bat2volt":bat2Volt}}
-				_ = c.Update(colQuerier, changeStatus)
-			}
-			if inst == "D0" {
-				positioning := arr[6]
-				latitude := arr[7]
-				longitude := arr[9]
-
-				// Update lock in DB
-				colQuerier := bson.M{"lockid": lock.LockID}
-				changeStatus := bson.M{"$set": bson.M{"positioning":positioning, "latitude":latitude, "longitude":longitude}}
-				_ = c.Update(colQuerier, changeStatus)
-			}
-			// send "Get Scooter Information" commands to connected scooter in every 10 seconds
-			// send positioning cmd
-			cmd := "*SCOS,OM,"
-			cmd += imei
-			cmd += ",D0"
-			cmd += "#"
-			array := util.MakeCMD(cmd)
-			conn.Write(array)
-			// // send get scooter information cmd
-			// cmd1 := "*SCOS,OM,"
-			// cmd1 += imei
-			// cmd1 += ",S6"
-			// cmd1 += "#"
-			// arr1 := makeCMD(cmd1)
-			// conn.Write(arr1)
-		}
-	}
-}
-
-// InitTCPServer initializes TCP server 
+// InitTCPServer initializes TCP server
 func InitTCPServer() {
 	ln, err := net.Listen("tcp", ":8082")
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatalf("Error creating tcp server", err)
 	}
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Fatal(err)
+			logger.Fatalf("Error binding client", err)
 		}
-		go handleRequestFromIoT(conn)
 		go handleRequestFromClient(conn)
-		go statusUpdator(conn)
 	}
 }
