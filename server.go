@@ -15,8 +15,10 @@ import (
 	"gopkg.in/mgo.v2/bson"
 )
 
-const mongoDBHost = "127.0.0.1:27017"
-const logPath = "/var/log/deezle.log"
+const (
+	mongoDBHost = "127.0.0.1:27017"
+	logPath = "/var/log/deezle.log"
+)
 
 var (
 	database *mgo.Database
@@ -24,18 +26,6 @@ var (
 )
 
 func init() {
-	// Logger
-	verbose = flag.Bool("verbose", false, "print info level logs to stdout")
-	flag.Parse()
-
-	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
-	if err != nil {
-		logger.Fatalf("Failed to open log file: %v", err)
-	}
-	defer lf.Close()
-	logger := logger.Init("Logger initialized!", *verbose, true, lf)
-	defer logger.Close()
-
 	// MongoDB session
 	mongoSession, err := mgo.Dial(mongoDBHost)
 	if err != nil {
@@ -46,32 +36,28 @@ func init() {
 }
 
 func registerScooter(imei string) string {
-	session := database.Session.Copy()
-	defer session.Close()
-	d := database.C("scooterstatus").With(session)
+	c := database.C("scooterstatus").With(database.Session.Copy())
 
-	var status common.ScooterStatus
-	status.ID = imei
-	err := d.Find(bson.M{"lockid": imei}).One(&status)
-	_ = d.Insert(&status)
+	status := common.ScooterStatus{
+		ID: imei,
+	}
+	err := c.Find(bson.M{"lockid": imei}).One(&status)
+	_ = c.Insert(&status)
 
-	session1 := database.Session.Copy()
-	defer session1.Close()
-	c := database.C("lock").With(session1)
+	d := database.C("lock").With(database.Session.Copy())
 
-	var lock common.Lock
-	lock.LockID = imei
-	lock.Locked = "true"
-	lock.Reserved = "false"
-	lock.Occupied = "false"
-	lock.Instruction = ""
-	err = c.Find(bson.M{"lockid": imei}).One(&lock)
-	if err != nil {
-		if err.Error() == "not found" {
-			err = c.Insert(&lock)
-			if err != nil {
-				return "Error"
-			}
+	lock := common.Lock{
+		LockID: imei,
+		Locked: "true",
+		Reserved: "false",
+		Occupied: "false",
+		Instruction: "",
+	}
+	err = d.Find(bson.M{"lockid": imei}).One(&lock)
+	if err.Error() == "not found" {
+		err = d.Insert(&lock)
+		if err != nil {
+			return "Error"
 		}
 		return "Success"
 	}
@@ -80,9 +66,7 @@ func registerScooter(imei string) string {
 
 // handleRequestFromClient handles the commands that triggers at first from server to IoT
 func handleRequestFromClient(conn net.Conn) {
-	session := database.Session.Copy()
-	defer session.Close()
-	c := database.C("lock").With(session)
+	c := database.C("lock").With(database.Session.Copy())
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
 	if err != nil {
 		logger.Fatalf("Failed to open log file: %v", err)
