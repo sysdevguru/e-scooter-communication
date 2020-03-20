@@ -2,14 +2,11 @@ package tcp
 
 import (
 	"bufio"
-	"flag"
+	"log"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 
-	"github.com/digitaloceanrepo/backend/common"
-	"github.com/digitaloceanrepo/backend/util"
 	"github.com/google/logger"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
@@ -17,69 +14,33 @@ import (
 
 const (
 	mongoDBHost = "127.0.0.1:27017"
-	logPath = "/var/log/deezle.log"
 )
 
 var (
 	database *mgo.Database
-	verbose *bool
+	verbose  *bool
 )
 
 func init() {
 	// MongoDB session
 	mongoSession, err := mgo.Dial(mongoDBHost)
 	if err != nil {
-		logger.Fatalf("Error Connecting MongoHost")
+		logger.Fatalf("Error Connecting MongoHost: %v", err)
 	}
 	mongoSession.SetMode(mgo.Monotonic, true)
 	database = mongoSession.DB("deezle")
 }
 
-func registerScooter(imei string) string {
-	c := database.C("scooterstatus").With(database.Session.Copy())
-
-	status := common.ScooterStatus{
-		ID: imei,
-	}
-	err := c.Find(bson.M{"lockid": imei}).One(&status)
-	_ = c.Insert(&status)
-
-	d := database.C("lock").With(database.Session.Copy())
-
-	lock := common.Lock{
-		LockID: imei,
-		Locked: "true",
-		Reserved: "false",
-		Occupied: "false",
-		Instruction: "",
-	}
-	err = d.Find(bson.M{"lockid": imei}).One(&lock)
-	if err.Error() == "not found" {
-		err = d.Insert(&lock)
-		if err != nil {
-			return "Error"
-		}
-		return "Success"
-	}
-	return "Exists"
-}
-
 // handleRequestFromClient handles the commands that triggers at first from server to IoT
 func handleRequestFromClient(conn net.Conn) {
-	c := database.C("lock").With(database.Session.Copy())
-	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
-	if err != nil {
-		logger.Fatalf("Failed to open log file: %v", err)
-	}
-	defer lf.Close()
-	logger := logger.Init("Logger initialized!", *verbose, true, lf)
-	defer logger.Close()
+	defer conn.Close()
 
+	c := database.C("lock").With(database.Session.Copy())
 	for {
 		var imei string
 		// Read message from IoT
 		message, _ := bufio.NewReader(conn).ReadString('\n')
-		logger.Info("Messsage from scooter", message)
+		log.Println("Messsage from scooter", message)
 
 		if strings.TrimSpace(message) != "" {
 			// Parse message from IoT
@@ -92,14 +53,14 @@ func handleRequestFromClient(conn net.Conn) {
 
 				// Register
 				if inst == "Q0" {
-					logger.Info("Connecting request from scooter:", imei)
+					log.Println("Connecting request from scooter:", imei)
 					result := registerScooter(imei)
 
 					if result == "Error" {
 						logger.Fatalf("Error while registering scooter:", imei)
 					}
 					if result == "Success" {
-						logger.Info("Successfully registered scooter:", imei)
+						log.Println("Successfully registered scooter:", imei)
 
 						// Setting scooter with default setting condition
 						instruction := "*SCOS,OM,"
@@ -115,7 +76,7 @@ func handleRequestFromClient(conn net.Conn) {
 						instruction += "#"
 
 						arr1 := util.MakeCMD(instruction)
-						logger.Info("Setting(S5) default values to scooter:", imei)
+						log.Println("Setting(S5) default values to scooter:", imei)
 						conn.Write(arr1)
 
 						instruction = "*SCOS,OM,"
@@ -128,17 +89,17 @@ func handleRequestFromClient(conn net.Conn) {
 						instruction += "#"
 
 						arr1 = util.MakeCMD(instruction)
-						logger.Info("Setting(D1) default values to scooter:", imei)
+						log.Println("Setting(D1) default values to scooter:", imei)
 						conn.Write(arr1)
 					}
 					if result == "Exists" {
-						logger.Info("Already exists:", imei)
+						log.Println("Already exists:", imei)
 					}
 				}
 
 				// Heartbeat
 				if inst == "H0" {
-					logger.Info("Heartbeat packet from scooter:", imei)
+					log.Println("Heartbeat packet from scooter:", imei)
 					var lock common.Lock
 					err := c.Find(bson.M{"lockid": imei}).One(&lock)
 					if err != nil {
@@ -163,7 +124,7 @@ func handleRequestFromClient(conn net.Conn) {
 				}
 
 				if inst == "R0" {
-					logger.Info("R0 cmd from scooter:", imei)
+					log.Println("R0 cmd from scooter:", imei)
 					key = arr[5]
 					instruction := "*SCOS,OM,"
 					instruction += imei
@@ -183,12 +144,12 @@ func handleRequestFromClient(conn net.Conn) {
 					}
 
 					arr := util.MakeCMD(instruction)
-					logger.Info("Sending cmd to scooter:", instruction, imei)
+					log.Println("Sending cmd to scooter:", instruction, imei)
 					conn.Write(arr)
 				}
 
 				if inst == "W0" {
-					logger.Info("Alert message from scooter:", imei)
+					log.Println("Alert message from scooter:", imei)
 					instruction := "*SCOS,OM,"
 					instruction += imei
 					instruction += ",V0,2"
@@ -199,7 +160,7 @@ func handleRequestFromClient(conn net.Conn) {
 				}
 
 				if inst == "L0" {
-					logger.Info("Unlocking Response from scooter:", imei)
+					log.Println("Unlocking Response from scooter:", imei)
 					instruction := "*SCOS,OM,"
 					instruction += imei
 					instruction += ",L0"
@@ -222,7 +183,7 @@ func handleRequestFromClient(conn net.Conn) {
 				}
 
 				if inst == "L1" {
-					logger.Info("Locking Response from scooter:", imei)
+					log.Println("Locking Response from scooter:", imei)
 					instruction := "*SCOS,OM,"
 					instruction += imei
 					instruction += ",L1"
@@ -264,7 +225,7 @@ func handleRequestFromClient(conn net.Conn) {
 
 					// Make scooter speed slower when battery is lower than 10%
 					if power < 10 {
-						logger.Info("Setting slow mode for scooter:", imei)
+						log.Println("Setting slow mode for scooter:", imei)
 						// Make scooter slower
 						cmd := "*SCOS,OM,"
 						cmd += imei
@@ -311,7 +272,7 @@ func handleRequestFromClient(conn net.Conn) {
 				cmd += timestamp
 				cmd += "#"
 				arr := util.MakeCMD(cmd)
-				logger.Info("Sending lock request to scooter:", imei)
+				log.Println("Sending lock request to scooter:", imei)
 				conn.Write(arr)
 			}
 
@@ -326,7 +287,7 @@ func handleRequestFromClient(conn net.Conn) {
 				cmd += timestamp
 				cmd += "#"
 				arr := util.MakeCMD(cmd)
-				logger.Info("Sending unlock request to scooter:", imei)
+				log.Println("Sending unlock request to scooter:", imei)
 				conn.Write(arr)
 			}
 
@@ -373,13 +334,13 @@ func handleRequestFromClient(conn net.Conn) {
 func InitTCPServer() {
 	ln, err := net.Listen("tcp", ":8082")
 	if err != nil {
-		logger.Fatalf("Error creating tcp server", err)
+		logger.Fatalf("Error creating tcp server: %s", err)
 	}
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			logger.Fatalf("Error binding client", err)
+			logger.Fatalf("Error binding client: %v", err)
 		}
 		go handleRequestFromClient(conn)
 	}
